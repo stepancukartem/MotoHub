@@ -1,4 +1,5 @@
-﻿using Quartz;
+﻿
+using Quartz;
 
 namespace MotoHub.Jobs
 {
@@ -11,13 +12,18 @@ namespace MotoHub.Jobs
             _logger = logger;
         }
 
-        public Task Execute(IJobExecutionContext context)
+        public Task Execute(IJobExecutionContext context, CancellationToken cancellationToken)
         {
             _logger.LogInformation(
                 "Фонове завдання MotoHub виконано о {Time}",
                 DateTimeOffset.Now);
 
             return Task.CompletedTask;
+        }
+
+        ValueTask IJob.Execute(IJobExecutionContext context, CancellationToken cancellationToken)
+        {
+            throw new NotImplementedException();
         }
     }
 }

@@ -1,3 +1,5 @@
+
+using AutoMapper;
 using FluentValidation;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
@@ -6,15 +8,16 @@ using MotoHub.DAL;
 using MotoHub.DAL.Repositories;
 using MotoHub.DAL.Repositories.Interfaces;
 using MotoHub.DTOs;
+using MotoHub.Jobs;
+using MotoHub.Middleware;
 using MotoHub.Services;
 using MotoHub.Services.Mapping;
 using MotoHub.Validators;
-using Scalar.AspNetCore;
-using System.Text;
-using Serilog;
-using MotoHub.Middleware;
-using MotoHub.Jobs;
 using Quartz;
+using Scalar.AspNetCore;
+using Serilog;
+using System.Security.Claims;
+using System.Text;
 
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Information()
@@ -25,97 +28,145 @@ Log.Logger = new LoggerConfiguration()
         retainedFileCountLimit: 7)
     .CreateLogger();
 
-var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddScoped<IMotorcycleRepository, MotorcycleRepository>();
-builder.Services.AddControllers();
-builder.Host.UseSerilog();
-builder.Services.AddScoped<MotoServiceService>();
-builder.Services.AddScoped<ReviewService>();
-builder.Services.AddScoped<BrandService>();
-builder.Services.AddScoped<CategoryService>();
-builder.Services.AddScoped<OrderService>();
-builder.Services.AddOpenApi();
-builder.Services.AddValidatorsFromAssemblyContaining<CreateMotorcycleValidator>();
-builder.Services.AddScoped<AuthService>();
-builder.Services.AddScoped<MotorcycleService>();
-builder.Services.AddDbContext<AppDbContext>(options =>
+try
 {
-    var connectionString =
-        builder.Configuration.GetConnectionString("DefaultConnection");
+    var builder = WebApplication.CreateBuilder(args);
 
-    options.UseNpgsql(connectionString);
-});
-var jwtKey = builder.Configuration["Jwt:Key"];
-builder.Services.AddAutoMapper(
-    typeof(MotoHubMappingProfile));
+    builder.Host.UseSerilog();
 
-builder.Services.AddQuartz(options =>
-{
-    var jobKey = new JobKey("DailyLogJob");
+    builder.Services.AddControllers();
+    builder.Services.AddOpenApi();
 
-    options.AddJob<DailyLogJob>(job =>
-        job.WithIdentity(jobKey));
+    // PostgreSQL
+    builder.Services.AddDbContext<AppDbContext>(options =>
+    {
+        var connectionString =
+            builder.Configuration.GetConnectionString("DefaultConnection");
 
-    options.AddTrigger(trigger =>
-        trigger
+        options.UseNpgsql(connectionString);
+    });
+
+    // Services
+    builder.Services.AddScoped<AuthService>();
+    builder.Services.AddScoped<MotorcycleService>();
+    builder.Services.AddScoped<BrandService>();
+    builder.Services.AddScoped<CategoryService>();
+    builder.Services.AddScoped<OrderService>();
+    builder.Services.AddScoped<ReviewService>();
+    builder.Services.AddScoped<MotoServiceService>();
+
+    // Repository
+    builder.Services.AddScoped<
+        IMotorcycleRepository,
+        MotorcycleRepository>();
+
+    // AutoMapper
+    builder.Services.AddAutoMapper(
+    cfg => { },
+    typeof(MotoHubMappingProfile).Assembly);
+
+    // FluentValidation
+    builder.Services.AddScoped<
+        IValidator<CreateMotorcycleDto>,
+        CreateMotorcycleValidator>();
+
+    builder.Services.AddScoped<
+        IValidator<CreateBrandDto>,
+        CreateBrandValidator>();
+
+    builder.Services.AddScoped<
+        IValidator<CreateCategoryDto>,
+        CreateCategoryValidator>();
+
+    // JWT
+    var jwtKey = builder.Configuration["Jwt:Key"];
+
+    if (string.IsNullOrWhiteSpace(jwtKey))
+    {
+        throw new InvalidOperationException(
+            "У конфігурації відсутній Jwt:Key.");
+    }
+
+    builder.Services
+        .AddAuthentication(
+            JwtBearerDefaults.AuthenticationScheme)
+        .AddJwtBearer(options =>
+        {
+            options.TokenValidationParameters =
+                new TokenValidationParameters
+                {
+                    ValidateIssuer = false,
+                    ValidateAudience = false,
+                    ValidateLifetime = true,
+                    ValidateIssuerSigningKey = true,
+
+                    IssuerSigningKey = new SymmetricSecurityKey(
+                        Encoding.UTF8.GetBytes(jwtKey)),
+
+                    RoleClaimType = ClaimTypes.Role
+                };
+        });
+
+    builder.Services.AddAuthorization();
+
+
+    // Quartz: фонове завдання
+    builder.Services.AddQuartz(options =>
+    {
+        var jobKey = new JobKey("DailyLogJob");
+
+        options.AddJob<DailyLogJob>(
+            job => job.WithIdentity(jobKey));
+
+        options.AddTrigger(trigger => trigger
             .ForJob(jobKey)
             .WithIdentity("DailyLogJob-trigger")
-            .WithSimpleSchedule(schedule =>
-                schedule
-                    .WithIntervalInHours(24)
-                    .RepeatForever()));
-});
-
-builder.Services.AddQuartzHostedService(options =>
-{
-    options.WaitForJobsToComplete = true;
-});
-
-builder.Services.AddAuthentication(
-    JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(options =>
-    {
-        options.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuer = false,
-            ValidateAudience = false,
-            ValidateLifetime = true,
-            ValidateIssuerSigningKey = true,
-
-            IssuerSigningKey = new SymmetricSecurityKey(
-                Encoding.UTF8.GetBytes(jwtKey!)),
-
-            RoleClaimType = System.Security.Claims.ClaimTypes.Role
-        };
+            .WithSimpleSchedule(schedule => schedule
+                .WithInterval(TimeSpan.FromHours(24))
+                .RepeatForever()));
     });
-builder.Services.AddScoped<
-    FluentValidation.IValidator<CreateBrandDto>,
-    CreateBrandValidator>();
 
-builder.Services.AddScoped<
-    FluentValidation.IValidator<CreateCategoryDto>,
-    CreateCategoryValidator>();
-builder.Services.AddAuthorization();
+    builder.Services.AddQuartzHostedService(options =>
+    {
+        options.WaitForJobsToComplete = true;
+    });
 
-var app = builder.Build();
 
-using (var scope = app.Services.CreateScope())
-{
-   var dbContext = scope.ServiceProvider
-        .GetRequiredService<AppDbContext>();
+    var app = builder.Build();
 
-    await DbSeeder.SeedAsync(dbContext);
+    // Початкові дані
+    using (var scope = app.Services.CreateScope())
+    {
+        var dbContext =
+            scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        await DbSeeder.SeedAsync(dbContext);
+    }
+
+    if (app.Environment.IsDevelopment())
+    {
+        app.MapOpenApi();
+        app.MapScalarApiReference();
+    }
+
+    app.UseMiddleware<RequestTimingMiddleware>();
+
+    app.UseSerilogRequestLogging();
+
+    app.UseHttpsRedirection();
+
+    app.UseAuthentication();
+    app.UseAuthorization();
+
+    app.MapControllers();
+
+    await app.RunAsync();
 }
-
-if (app.Environment.IsDevelopment())
+catch (Exception ex)
 {
-    app.MapOpenApi();
-    app.MapScalarApiReference();
+    Log.Fatal(ex, "MotoHub завершив роботу через помилку");
 }
-app.UseMiddleware<RequestTimingMiddleware>();
-app.UseHttpsRedirection();
-app.UseAuthentication();
-app.UseAuthorization();
-app.MapControllers();
-
-app.Run();
+finally
+{
+    await Log.CloseAndFlushAsync();
+}
